@@ -1,18 +1,6 @@
-"""
-Handyman / کاریگر — Complete Demo App (Streamlit)
--------------------------------------------------
-Features:
-1. Multi-language (English, Urdu, Sindhi) with dynamic UI & Chat greetings.
-2. SQLite Database for Users, Bookings, Ratings & Password Reset.
-3. Persistent Login Session (Stays logged in across refreshes).
-4. Forgot Password / OTP Flow for recovery.
-5. Interactive Map & Messenger Chat.
-"""
-
 import time
 import random
 import os
-import base64
 import sqlite3
 import hashlib
 from datetime import datetime
@@ -28,14 +16,6 @@ st.set_page_config(
     page_icon="🛠️",
     layout="centered",
 )
-
-def get_logo_base64():
-    if os.path.exists("logo.png"):
-        with open("logo.png", "rb") as f:
-            return base64.b64encode(f.read()).decode()
-    return None
-
-LOGO_B64 = get_logo_base64()
 
 # ---------------------------------------------------------------------------
 # DATABASE SETUP (SQLite)
@@ -53,17 +33,22 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'customer',
+            name TEXT DEFAULT 'User',
+            service_type TEXT DEFAULT 'plumber',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT NOT NULL,
+            customer_phone TEXT NOT NULL,
             service TEXT NOT NULL,
             address TEXT NOT NULL,
             worker_name TEXT,
             visit_charge REAL DEFAULT 500,
+            final_amount REAL DEFAULT 500,
+            payment_method TEXT DEFAULT 'Cash',
             status TEXT DEFAULT 'Pending',
             rating INTEGER DEFAULT 0,
             review TEXT,
@@ -76,7 +61,7 @@ def init_db():
 def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
-def register_user(phone, password):
+def register_user(phone, password, role="customer", name="User", service_type="plumber"):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT id FROM users WHERE phone = ?", (phone,))
@@ -84,8 +69,8 @@ def register_user(phone, password):
         conn.close()
         return False, "exists"
     cur.execute(
-        "INSERT INTO users (phone, password_hash) VALUES (?, ?)",
-        (phone, hash_password(password)),
+        "INSERT INTO users (phone, password_hash, role, name, service_type) VALUES (?, ?, ?, ?, ?)",
+        (phone, hash_password(password), role, name, service_type),
     )
     conn.commit()
     conn.close()
@@ -94,14 +79,14 @@ def register_user(phone, password):
 def verify_user(phone, password):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT password_hash FROM users WHERE phone = ?", (phone,))
+    cur.execute("SELECT password_hash, role, name, service_type FROM users WHERE phone = ?", (phone,))
     row = cur.fetchone()
     conn.close()
     if row is None:
-        return False, "no_user"
+        return False, "no_user", None, None, None
     if row[0] == hash_password(password):
-        return True, "ok"
-    return False, "wrong_pw"
+        return True, "ok", row[1], row[2], row[3]
+    return False, "wrong_pw", None, None, None
 
 def update_user_password(phone, new_password):
     conn = get_db()
@@ -110,17 +95,24 @@ def update_user_password(phone, new_password):
     conn.commit()
     conn.close()
 
-def save_booking(phone, service, address, worker_name):
+def save_booking(phone, service, address, worker_name, payment_method):
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO bookings (phone, service, address, worker_name, status) VALUES (?, ?, ?, ?, ?)",
-        (phone, service, address, worker_name, "Accepted"),
+        "INSERT INTO bookings (customer_phone, service, address, worker_name, payment_method, status) VALUES (?, ?, ?, ?, ?, ?)",
+        (phone, service, address, worker_name, payment_method, "Accepted"),
     )
     booking_id = cur.lastrowid
     conn.commit()
     conn.close()
     return booking_id
+
+def update_booking_status_with_amount(booking_id, status, final_amount):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE bookings SET status = ?, final_amount = ? WHERE id = ?", (status, final_amount, booking_id))
+    conn.commit()
+    conn.close()
 
 def update_booking_rating(booking_id, rating, review):
     conn = get_db()
@@ -135,7 +127,15 @@ def update_booking_rating(booking_id, rating, review):
 def get_user_bookings(phone):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, service, address, worker_name, status, rating, review, created_at FROM bookings WHERE phone = ? ORDER BY id DESC", (phone,))
+    cur.execute("SELECT id, service, address, worker_name, status, rating, review, created_at, payment_method, final_amount FROM bookings WHERE customer_phone = ? ORDER BY id DESC", (phone,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_worker_bookings(worker_name):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, service, address, customer_phone, status, visit_charge, payment_method, created_at, final_amount FROM bookings WHERE worker_name = ? ORDER BY id DESC", (worker_name,))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -214,7 +214,7 @@ st.markdown(APP_STYLE, unsafe_allow_html=True)
 BAHRIA_TOWN_KARACHI = {"lat": 24.8607, "lng": 67.0011}
 
 # ---------------------------------------------------------------------------
-# TRANSLATIONS
+# TRANSLATIONS (English, Urdu, Sindhi Only)
 # ---------------------------------------------------------------------------
 T = {
     "en": {
@@ -228,6 +228,10 @@ T = {
         "mode_login": "Login",
         "mode_register": "Create Account",
         "register_btn": "🚀 Create Account",
+        "role_label": "Select Account Type",
+        "role_customer": "Customer",
+        "role_worker": "Worker / Provider",
+        "name_label": "Full Name",
         "err_no_user": "No account found with this number. Please register.",
         "err_wrong_pw": "Incorrect password. Please try again.",
         "err_phone_exists": "This number is already registered.",
@@ -263,6 +267,10 @@ T = {
         "visit_charge_label": "🧾 Visiting Charges: Rs. 500",
         "visit_note": "Pay only visiting charges now. Repair cost will be decided on-site.",
         "visit_warranty": "✅ Warranty: Free repair if same issue occurs again.",
+        "payment_method": "💳 Payment Method",
+        "pay_cash": "Cash on Delivery",
+        "pay_jazzcash": "JazzCash Mobile Wallet",
+        "pay_easypaisa": "EasyPaisa Mobile Wallet",
         "notif_title": "🔔 New Response!",
         "notif_body": "{name} ({service}) accepted your request and is on the way.",
         "accept": "Accept",
@@ -281,6 +289,9 @@ T = {
         "type_message": "Type a message...",
         "send": "Send",
         "history_title": "📋 Booking History & Rating",
+        "worker_dashboard": "👷 Worker Dashboard",
+        "total_earnings": "💰 Total Earnings",
+        "complete_job": "✅ Mark Completed",
         "rate_worker": "⭐ Rate Worker",
         "submit_rating": "Submit Feedback",
         "app_tagline": "Book trusted handymen near you",
@@ -296,6 +307,10 @@ T = {
         "mode_login": "لاگ ان",
         "mode_register": "اکاؤنٹ بنائیں",
         "register_btn": "🚀 اکاؤنٹ بنائیں",
+        "role_label": "اکاؤنٹ کی قسم منتخب کریں",
+        "role_customer": "کسٹمر",
+        "role_worker": "کاریگر / ورکر",
+        "name_label": "पूरा नाम",
         "err_no_user": "اس نمبر سے اکاؤنٹ نہیں ملا۔ براہ کرم رجسٹر کریں۔",
         "err_wrong_pw": "پاس ورڈ غلط ہے۔ دوبارہ کوشش کریں۔",
         "err_phone_exists": "یہ نمبر پہلے سے رجسٹرڈ ہے۔",
@@ -331,6 +346,10 @@ T = {
         "visit_charge_label": "🧾 وزٹنگ چارجز: روپے 500",
         "visit_note": "ابھی صرف وزٹنگ چارجز ادا کریں۔ کام دیکھنے کے بعد قیمت طے ہوگی۔",
         "visit_warranty": "✅ گارنٹی: اگر دوبارہ مسئلہ آیا تو مرمت مفت ہوگی۔",
+        "payment_method": "💳 ادائیگی کا طریقہ",
+        "pay_cash": "کیش آن ڈلیوری",
+        "pay_jazzcash": "جاز کیش موبائل والٹ",
+        "pay_easypaisa": "ایزی پیسا موبائل والٹ",
         "notif_title": "🔔 نیا جواب!",
         "notif_body": "{name} ({service}) نے آپ کی درخواست قبول کر لی ہے اور راستے میں ہے۔",
         "accept": "قبول کریں",
@@ -349,6 +368,9 @@ T = {
         "type_message": "پیغام لکھیں...",
         "send": "بھیجیں",
         "history_title": "📋 بکنگ ہسٹری اور ریٹنگ",
+        "worker_dashboard": "👷 ورکر ڈ্যাশবোর্ড",
+        "total_earnings": "💰 کل آمدنی",
+        "complete_job": "✅ کام مکمل ہو گیا",
         "rate_worker": "⭐ کاریگر کو ریٹنگ دیں",
         "submit_rating": "فیڈ بیک جمع کریں",
         "app_tagline": "اپنے قریب قابلِ اعتماد کاریگر بک کریں",
@@ -364,6 +386,10 @@ T = {
         "mode_login": "لاگ ان",
         "mode_register": "اڪائونٽ ٺاهيو",
         "register_btn": "🚀 اڪائونٽ ٺاهيو",
+        "role_label": "اڪائونٽ جي قسم چونڊيو",
+        "role_customer": "ڪسٽمر",
+        "role_worker": "ڪاريگر / ورڪر",
+        "name_label": "پورو نالو",
         "err_no_user": "هن نمبر سان اڪائونٽ نه مليو. رجسٽر ڪريو.",
         "err_wrong_pw": "پاسورڊ غلط آهي. ٻيهر ڪوشش ڪريو.",
         "err_phone_exists": "هي نمبر اڳ ۾ رجسٽرڊ آهي.",
@@ -399,6 +425,10 @@ T = {
         "visit_charge_label": "🧾 وزٽنگ چارجز: 500 روپيا",
         "visit_note": "هاڻي رڳو وزٽنگ چارجز ڏيو. ڪم ڏسڻ کان پوءِ قيمت طئي ٿيندي.",
         "visit_warranty": "✅ گارنٽي: جيڪڏهن ساڳيو مسئلو ٻيهر ٿيو ته مرمت مفت هوندي.",
+        "payment_method": "💳 ادائگي جو طريقو",
+        "pay_cash": "ڪيش آن ڊليوري",
+        "pay_jazzcash": "جاز ڪيش موبائل والٽ",
+        "pay_easypaisa": "ايزي پيسا موبائل والٽ",
         "notif_title": "🔔 نئون جواب!",
         "notif_body": "{name} ({service}) اوهان جي درخواست قبول ڪئي آهي ۽ رستي ۾ آهي.",
         "accept": "قبول ڪريو",
@@ -417,6 +447,9 @@ T = {
         "type_message": "پيغام لکو...",
         "send": "موڪليو",
         "history_title": "📋 بکنگ هسٽري ۽ ريٽنگ",
+        "worker_dashboard": "👷 ورڪر ڊيش بورڊ",
+        "total_earnings": "💰 ڪل آمدني",
+        "complete_job": "✅ ڪم مڪمل ٿيو",
         "rate_worker": "⭐ ڪاريگر کي ريٽنگ ڏيو",
         "submit_rating": "فيڊبيڪ موڪليو",
         "app_tagline": "پنهنجي ويجهو ڀروسي وارا ڪاريگر بڪ ڪريو",
@@ -450,18 +483,20 @@ SERVICE_LABELS = {
 }
 
 DEMO_WORKERS = [
-    {"name": "Ali Ahmed", "rating": 4.8},
-    {"name": "Bilal Khan", "rating": 4.6},
-    {"name": "Sana Malik", "rating": 4.9},
-    {"name": "Usman Tariq", "rating": 4.7},
+    {"name": "Ali Ahmed", "rating": 4.8, "service": "plumber"},
+    {"name": "Bilal Khan", "rating": 4.6, "service": "electrician"},
+    {"name": "Sana Malik", "rating": 4.9, "service": "ac_repairing"},
+    {"name": "Usman Tariq", "rating": 4.7, "service": "solar_system"},
 ]
 
 # ---------------------------------------------------------------------------
-# SESSION STATE INIT (Persistent Session Handling)
+# SESSION STATE INIT
 # ---------------------------------------------------------------------------
 defaults = {
     "lang": "en",
     "logged_in": False,
+    "user_role": "customer",
+    "user_name": "User",
     "page": "login",
     "category": None,
     "booking_state": None,
@@ -473,9 +508,10 @@ defaults = {
     "loc_address": "Karachi",
     "loc_custom_input": "",
     "user_phone": "",
-    "auth_mode": "login", # login, register, forgot
+    "auth_mode": "login",
     "reset_otp": None,
     "reset_phone": None,
+    "payment_method": "Cash",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -505,16 +541,11 @@ def get_time_greeting():
         else: return "🌙 Good Night!"
 
 def app_title():
-    if LOGO_B64:
-        logo_html = f"<img src='data:image/png;base64,{LOGO_B64}' style='width:140px;'/>"
-    else:
-        logo_html = "<div style='font-size:12px; font-weight:700; color:#E7752F; text-transform:uppercase;'>Trusted Home Services</div>"
     st.markdown(
-        f"""
+        """
         <div style='text-align:center; line-height:1.15; padding-bottom:6px;'>
-            <div style='display:flex; justify-content:center;'>{logo_html}</div>
-            <div style='font-size:30px; font-weight:800; color:#063260;'>Handyman</div>
-            <div dir='rtl' lang='ur' style='font-size:22px; font-weight:700; color:#E7752F;'>کاریگر</div>
+            <div style='font-size:32px; font-weight:800; color:#063260;'>Handyman</div>
+            <div dir='rtl' lang='ur' style='font-size:24px; font-weight:700; color:#E7752F;'>کاریگر</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -616,10 +647,12 @@ def page_login():
                 elif not password.strip():
                     st.error(tr("err_wrong_pw"))
                 else:
-                    ok, reason = verify_user(phone.strip(), password)
+                    ok, reason, role, name, s_type = verify_user(phone.strip(), password)
                     if ok:
                         st.session_state.logged_in = True
                         st.session_state.user_phone = phone.strip()
+                        st.session_state.user_role = role
+                        st.session_state.user_name = name
                         st.session_state.page = "home"
                         st.rerun()
                     elif reason == "no_user":
@@ -632,14 +665,23 @@ def page_login():
                 st.session_state.auth_mode = "forgot"
                 st.rerun()
 
-        else: # register
+        else:
+            name = st.text_input(tr("name_label"), placeholder="Ali Ahmed", key="reg_name_input")
+            role_choice = st.selectbox(tr("role_label"), options=["customer", "worker"], format_func=lambda r: tr("role_customer") if r == "customer" else tr("role_worker"), key="reg_role_input")
+            
+            s_type = "plumber"
+            if role_choice == "worker":
+                s_type = st.selectbox(tr("select_service"), options=list(SERVICE_LABELS.keys()), format_func=lambda s: SERVICE_LABELS[s], key="reg_service_input")
+
             if st.button(tr("register_btn"), use_container_width=True, type="primary", key="action_register_btn"):
                 if not valid_phone(phone):
                     st.error(tr("err_phone_invalid"))
+                elif not name.strip():
+                    st.error("Please enter your name.")
                 elif len(password.strip()) < 4:
                     st.error(tr("err_wrong_pw"))
                 else:
-                    ok, reason = register_user(phone.strip(), password)
+                    ok, reason = register_user(phone.strip(), password, role=role_choice, name=name.strip(), service_type=s_type)
                     if ok:
                         st.success(tr("reg_success"))
                         st.session_state.auth_mode = "login"
@@ -663,11 +705,56 @@ def page_home():
                     border:1.5px solid #E7752F; border-radius:14px; padding:10px 16px;
                     text-align:center; font-weight:700; font-size:14px; color:#063260;
                     margin-bottom:12px;'>
-            {get_time_greeting()}
+            {get_time_greeting()} — {st.session_state.user_name}
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+    if st.session_state.user_role == "worker":
+        st.subheader(tr("worker_dashboard"))
+        
+        rows = get_worker_bookings(st.session_state.user_name)
+        total_earn = sum([r[8] for r in rows if r[4] == "Completed"])
+        
+        st.markdown(
+            f"""
+            <div style='background:#FCFBE8; border:2px solid #F0E9D2; border-radius:14px; padding:12px 16px; margin-bottom:12px; text-align:center;'>
+                <div style='font-size:14px; color:#5A4A2A;'>{tr('total_earnings')}</div>
+                <div style='font-size:24px; font-weight:800; color:#E7752F;'>Rs. {total_earn}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if not rows:
+            st.info("No service requests assigned yet.")
+        else:
+            for r in rows:
+                b_id, s_name, addr, c_phone, status, v_charge, p_method, c_at, f_amt = r
+                with st.expander(f"🛠️ {s_name.upper()} — {addr} ({status})"):
+                    st.write(f"**Customer Phone:** {c_phone}")
+                    st.write(f"**Payment Method:** {p_method}")
+                    st.write(f"**Visiting Charges:** Rs. {v_charge}")
+                    if status == "Completed":
+                        st.write(f"**Final Bill Amount:** Rs. {f_amt}")
+                    st.write(f"**Date:** {c_at}")
+                    
+                    if status == "Accepted":
+                        final_bill_input = st.number_input("Enter Final Total Bill Amount (Rs.)", min_value=500.0, value=500.0, step=100.0, key=f"bill_{b_id}")
+                        if st.button(tr("complete_job"), use_container_width=True, type="primary", key=f"complete_job_{b_id}"):
+                            update_booking_status_with_amount(b_id, "Completed", final_bill_input)
+                            st.success(f"Job completed successfully! Final Bill Rs. {final_bill_input} recorded.")
+                            st.rerun()
+
+        st.write("")
+        if st.button(tr("logout"), use_container_width=True, key="worker_logout_btn"):
+            for k, v in defaults.items():
+                st.session_state[k] = v
+            st.rerun()
+        return
+
+    # Customer Home
     st.caption(tr("app_tagline"))
     st.write("---")
 
@@ -709,12 +796,12 @@ def page_home():
         st.rerun()
 
     st.write("")
-    if st.button("📋  " + tr("history_title"), use_container_width=True, key="home_history_btn"):
+    if st.button(tr("history_title"), use_container_width=True, key="home_history_btn"):
         st.session_state.page = "history"
         st.rerun()
 
     st.write("")
-    if st.button(tr("logout"), use_container_width=True, key="home_logout_btn"):
+    if st.button(tr("logout"), use_container_width=True, key="customer_logout_btn"):
         for k, v in defaults.items():
             st.session_state[k] = v
         st.rerun()
@@ -722,240 +809,257 @@ def page_home():
 def page_category():
     app_title()
     st.write("")
-    st.subheader(tr("select_service"))
-
-    services = ["plumber", "electrician", "ac_repairing", "solar_system", "gardening", "cleaning", "painter"]
-    cols = st.columns(2)
-    for i, s in enumerate(services):
-        with cols[i % 2]:
-            if st.button(f"{SERVICE_ICONS[s]}  {SERVICE_LABELS[s]}", use_container_width=True, key=f"svc_btn_{s}"):
-                st.session_state.category = s
-                st.session_state.booking_state = None
-                st.session_state.page = "booking"
-                st.rerun()
-
-    st.write("")
-    if st.button("⬅ " + tr("back"), use_container_width=True, key="cat_back_btn"):
+    if st.button("⬅ " + tr("back"), key="cat_back_btn"):
         st.session_state.page = "home"
         st.rerun()
 
-def draw_map(worker_lat=None, worker_lng=None):
-    m = folium.Map(
-        location=[BAHRIA_TOWN_KARACHI["lat"], BAHRIA_TOWN_KARACHI["lng"]],
-        zoom_start=11,
-        tiles="OpenStreetMap",
-    )
-    folium.Marker(
-        [BAHRIA_TOWN_KARACHI["lat"], BAHRIA_TOWN_KARACHI["lng"]],
-        tooltip="You",
-        icon=folium.Icon(color="blue", icon="home"),
-    ).add_to(m)
+    st.subheader(tr("select_service"))
+    st.write("")
 
-    if worker_lat is not None:
-        folium.Marker(
-            [worker_lat, worker_lng],
-            tooltip=st.session_state.worker["name"] if st.session_state.worker else "Worker",
-            icon=folium.Icon(color="green", icon="wrench", prefix="fa"),
-        ).add_to(m)
-        folium.PolyLine(
-            [[worker_lat, worker_lng], [BAHRIA_TOWN_KARACHI["lat"], BAHRIA_TOWN_KARACHI["lng"]]],
-            color="green",
-            weight=3,
-            dash_array="6",
-        ).add_to(m)
-
-    st_folium(m, height=300, width=None, returned_objects=[])
+    cols = st.columns(2)
+    services = list(SERVICE_LABELS.keys())
+    for idx, s_key in enumerate(services):
+        col = cols[idx % 2]
+        with col:
+            icon = SERVICE_ICONS.get(s_key, "🛠️")
+            label = SERVICE_LABELS[s_key]
+            if st.button(f"{icon} {label}", use_container_width=True, key=f"serv_btn_{s_key}"):
+                st.session_state.category = s_key
+                st.session_state.page = "booking"
+                st.rerun()
 
 def page_booking():
     app_title()
     st.write("")
-    if st.session_state.category:
-        cat = st.session_state.category
-        st.subheader(f"{SERVICE_ICONS[cat]}  {SERVICE_LABELS[cat]}")
+    if st.button("⬅ " + tr("back"), key="booking_back_btn"):
+        st.session_state.page = "category"
+        st.rerun()
 
-    state = st.session_state.booking_state
-    st.markdown(f"<div style='font-size:13px; color:#5A4A2A; margin-bottom:8px;'>📍 <b>{st.session_state.loc_address}</b></div>", unsafe_allow_html=True)
+    s_key = st.session_state.category or "plumber"
+    s_icon = SERVICE_ICONS.get(s_key, "🛠️")
+    s_name = SERVICE_LABELS.get(s_key, "Service")
 
-    if state is None:
-        st.markdown(
-            f"""
-            <div style='background:#FCFBE8; border:2px solid #F0E9D2; border-radius:14px; padding:12px 16px; margin-bottom:12px;'>
-                <div style='font-weight:800; color:#063260; font-size:15px;'>{tr('visit_charge_label')}</div>
-                <div style='font-size:13px; color:#5A4A2A; margin-top:4px;'>{tr('visit_note')}</div>
-                <div style='font-size:13px; color:#2E7D32; margin-top:6px; font-weight:600;'>{tr('visit_warranty')}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        draw_map()
-        st.write("")
-        if st.button("🔍  " + tr("find_handyman"), use_container_width=True, type="primary", key="booking_find_btn"):
-            st.session_state.booking_state = "searching"
-            st.rerun()
+    st.subheader(f"{s_icon} {s_name}")
+    st.markdown(tr("visit_charge_label"))
+    st.info(tr("visit_note"))
+    st.success(tr("visit_warranty"))
 
-    elif state == "searching":
+    st.write("---")
+    st.markdown(f"**{tr('payment_method')}**")
+    pay_options = ["Cash", "JazzCash", "EasyPaisa"]
+    pay_format = {
+        "Cash": tr("pay_cash"),
+        "JazzCash": tr("pay_jazzcash"),
+        "EasyPaisa": tr("pay_easypaisa"),
+    }
+    st.session_state.payment_method = st.radio(
+        "payment_method_radio",
+        options=pay_options,
+        format_func=lambda o: pay_format[o],
+        label_visibility="collapsed",
+    )
+
+    st.write("")
+    if st.button(tr("find_handyman"), use_container_width=True, type="primary", key="action_find_handyman"):
         with st.spinner(tr("searching")):
-            time.sleep(1.5)
-        st.session_state.worker = random.choice(DEMO_WORKERS)
-        st.session_state.booking_state = "notified"
+            time.sleep(1.2)
+        
+        matched_worker = next((w for w in DEMO_WORKERS if w["service"] == s_key), DEMO_WORKERS[0])
+        st.session_state.worker = matched_worker
+        
+        b_id = save_booking(
+            phone=st.session_state.user_phone,
+            service=s_name,
+            address=st.session_state.loc_address,
+            worker_name=matched_worker["name"],
+            payment_method=st.session_state.payment_method,
+        )
+        st.session_state.current_booking_id = b_id
         st.session_state.worker_step = 0
+        st.session_state.page = "active_booking"
         st.rerun()
 
-    elif state == "notified":
-        worker = st.session_state.worker
-        cat_label = SERVICE_LABELS[st.session_state.category]
-        st.info(f"**{tr('notif_title')}**\n\n" + tr("notif_body").format(name=worker["name"], service=cat_label))
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("✅ " + tr("accept"), use_container_width=True, type="primary", key="booking_accept_btn"):
-                st.session_state.booking_state = "accepted"
-                st.session_state.worker_step = 0
-                booking_id = save_booking(
-                    st.session_state.user_phone,
-                    cat_label,
-                    st.session_state.loc_address,
-                    worker["name"],
-                )
-                st.session_state.current_booking_id = booking_id
-                st.rerun()
-        with c2:
-            if st.button("❌ " + tr("decline"), use_container_width=True, key="booking_decline_btn"):
-                st.session_state.booking_state = None
-                st.session_state.worker = None
-                st.rerun()
-
-    elif state in ("accepted", "arrived"):
-        worker = st.session_state.worker
-        step = st.session_state.worker_step
-        lat_offsets = [0.05, 0.03, 0.01, 0.0]
-        lng_offsets = [0.05, 0.03, 0.01, 0.0]
-        curr_lat = BAHRIA_TOWN_KARACHI["lat"] + lat_offsets[min(step, 3)]
-        curr_lng = BAHRIA_TOWN_KARACHI["lng"] + lng_offsets[min(step, 3)]
-
-        st.success(f"👷 **{worker['name']}** — ⭐ {worker['rating']}")
-        if step < 3:
-            st.info(f"🚗 {tr('worker_enroute')} ({tr('eta')}: {(3 - step) * 5} {tr('min')})")
-            draw_map(curr_lat, curr_lng)
-            if st.button(tr("simulate_move"), use_container_width=True, type="primary", key="booking_sim_move_btn"):
-                st.session_state.worker_step += 1
-                if st.session_state.worker_step >= 3:
-                    st.session_state.booking_state = "arrived"
-                st.rerun()
-        else:
-            st.balloons()
-            st.success(tr("arrived"))
-            draw_map(BAHRIA_TOWN_KARACHI["lat"], BAHRIA_TOWN_KARACHI["lng"])
-
-        st.write("")
-        col_call, col_chat = st.columns(2)
-        with col_call:
-            if st.button(tr("call"), use_container_width=True, key="booking_call_btn"):
-                st.session_state.page = "call"
-                st.rerun()
-        with col_chat:
-            if st.button(tr("message"), use_container_width=True, key="booking_chat_btn"):
-                st.session_state.page = "chat"
-                st.rerun()
-
-        st.write("")
-        if st.button("⬅ " + tr("back"), use_container_width=True, key="booking_back_btn"):
-            st.session_state.page = "category"
-            st.rerun()
-
-def page_chat():
+def page_active_booking():
     app_title()
-    worker = st.session_state.worker
-    st.subheader(f"{tr('chat_title')} {worker['name'] if worker else 'Worker'}")
-
-    chat_container = st.container()
-    with chat_container:
-        for msg in st.session_state.chat_messages:
-            if msg["sender"] == "user":
-                st.markdown(f"<div style='text-align:right; color:#063260; background:#F0E9D2; padding:8px; border-radius:10px; margin:4px 0;'><b>You:</b> {msg['text']}</div>", unsafe_allow_html=True)
-            else:
-                st.markdown(f"<div style='text-align:left; color:#E7752F; background:#FCFBE8; padding:8px; border-radius:10px; margin:4px 0;'><b>{worker['name']}:</b> {msg['text']}</div>", unsafe_allow_html=True)
-
-    with st.form("chat_form", clear_on_submit=True):
-        txt = st.text_input(tr("type_message"), label_visibility="collapsed", key="chat_input_box")
-        submitted = st.form_submit_button(tr("send"))
-        if submitted and txt.strip():
-            st.session_state.chat_messages.append({"sender": "user", "text": txt.strip()})
-            lang = st.session_state.lang
-            bot_reply = random.choice(AUTO_RESPONSES.get(lang, AUTO_RESPONSES["en"]))
-            st.session_state.chat_messages.append({"sender": "worker", "text": bot_reply})
-            st.rerun()
-
     st.write("")
-    if st.button("⬅ " + tr("back"), use_container_width=True, key="chat_back_btn"):
-        st.session_state.page = "booking"
-        st.rerun()
 
-def page_call():
-    app_title()
-    st.subheader(tr("call_screen_title"))
-    worker = st.session_state.worker
-    st.markdown(f"### 📞 {worker['name'] if worker else 'Worker'}")
-    st.write("Connecting audio call...")
+    worker = st.session_state.worker or DEMO_WORKERS[0]
+    w_name = worker["name"]
+    w_rating = worker["rating"]
+    s_key = st.session_state.category or "plumber"
+    s_name = SERVICE_LABELS.get(s_key, "Service")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.button(tr("mute"), use_container_width=True, key="call_mute_btn")
-    with c2:
-        if st.button(tr("end_call"), use_container_width=True, type="primary", key="call_end_btn"):
-            st.session_state.page = "booking"
-            st.rerun()
+    st.markdown(
+        f"""
+        <div style='background:#FCFBE8; border:2px solid #F0E9D2; border-radius:16px; padding:14px 16px; margin-bottom:14px; text-align:center;'>
+            <div style='font-size:18px; font-weight:800; color:#063260;'>{w_name}</div>
+            <div style='font-size:14px; color:#E7752F; font-weight:600;'>{s_name} ⭐ {w_rating}</div>
+            <div style='font-size:13px; color:#5A4A2A; margin-top:4px;'>📍 {st.session_state.loc_address}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-def page_history():
-    app_title()
-    st.subheader(tr("history_title"))
+    m = folium.Map(location=[BAHRIA_TOWN_KARACHI["lat"], BAHRIA_TOWN_KARACHI["lng"]], zoom_start=14, tiles="CartoDB positron")
     
-    rows = get_user_bookings(st.session_state.user_phone)
-    if not rows:
-        st.info("No bookings found yet.")
+    step = st.session_state.worker_step
+    lat_offset = 0.012 - (step * 0.003) if step < 4 else 0.0
+    lng_offset = 0.008 - (step * 0.002) if step < 4 else 0.0
+    
+    worker_lat = BAHRIA_TOWN_KARACHI["lat"] + lat_offset
+    worker_lng = BAHRIA_TOWN_KARACHI["lng"] + lng_offset
+
+    folium.Marker(
+        [BAHRIA_TOWN_KARACHI["lat"], BAHRIA_TOWN_KARACHI["lng"]],
+        popup="Customer Location",
+        icon=folium.Icon(color="orange", icon="home", prefix="fa")
+    ).add_to(m)
+
+    folium.Marker(
+        [worker_lat, worker_lng],
+        popup=w_name,
+        icon=folium.Icon(color="blue", icon="wrench", prefix="fa")
+    ).add_to(m)
+
+    st_folium(m, height=220, use_container_width=True)
+
+    if step < 4:
+        eta_mins = max(1, 15 - (step * 4))
+        st.info(f"🚗 {tr('worker_enroute')} — {tr('eta')}: **{eta_mins} {tr('min')}**")
+        if st.button(tr("simulate_move"), use_container_width=True, key="action_sim_move"):
+            st.session_state.worker_step += 1
+            st.rerun()
     else:
-        for r in rows:
-            b_id, s_name, addr, w_name, status, rating, review, c_at = r
-            with st.expander(f"🛠️ {s_name.upper()} — {w_name} ({status})"):
-                st.write(f"**Address:** {addr}")
-                st.write(f"**Date:** {c_at}")
-                if rating > 0:
-                    st.write(f"**Rating:** {'⭐' * rating}")
-                    if review:
-                        st.write(f"**Review:** {review}")
-                else:
-                    st.markdown(f"**{tr('rate_worker')}**")
-                    with st.form(f"rate_form_{b_id}"):
-                        stars = st.slider("Rating", 1, 5, 5, key=f"star_{b_id}")
-                        rev_text = st.text_input("Review Comment", key=f"rev_{b_id}")
-                        submitted = st.form_submit_button(tr("submit_rating"))
-                        if submitted:
-                            update_booking_rating(b_id, stars, rev_text)
-                            st.success("Thank you for your feedback!")
-                            st.rerun()
+        st.success(tr("arrived"))
 
     st.write("")
-    if st.button("⬅ " + tr("back"), use_container_width=True, key="history_back_btn"):
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        if st.button(tr("call"), use_container_width=True, key="action_call_btn"):
+            st.session_state.page = "call_screen"
+            st.rerun()
+    with bc2:
+        if st.button(tr("message"), use_container_width=True, key="action_chat_btn"):
+            st.session_state.page = "chat_screen"
+            st.rerun()
+
+    st.write("")
+    if st.button("⬅ " + tr("back"), use_container_width=True, key="active_to_home"):
         st.session_state.page = "home"
         st.rerun()
 
+def page_call_screen():
+    app_title()
+    st.write("")
+    worker = st.session_state.worker or DEMO_WORKERS[0]
+    st.markdown(
+        f"""
+        <div style='text-align:center; padding:30px 0;'>
+            <div style='font-size:24px; font-weight:800; color:#063260;'>{worker['name']}</div>
+            <div style='font-size:15px; color:#E7752F; margin-top:6px;'>{tr('call_screen_title')}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        if st.button(tr("mute"), use_container_width=True, key="call_mute"):
+            st.toast("Call muted")
+    with cc2:
+        if st.button(tr("end_call"), use_container_width=True, type="primary", key="call_end"):
+            st.session_state.page = "active_booking"
+            st.rerun()
+
+def page_chat_screen():
+    app_title()
+    worker = st.session_state.worker or DEMO_WORKERS[0]
+    st.markdown(f"**💬 {tr('chat_title')} {worker['name']}**")
+    st.write("---")
+
+    chat_container = st.container(height=260)
+    with chat_container:
+        if not st.session_state.chat_messages:
+            lang = st.session_state.lang or "en"
+            intro = AUTO_RESPONSES.get(lang, AUTO_RESPONSES["en"])[0]
+            st.session_state.chat_messages.append({"sender": "worker", "text": intro})
+        
+        for msg in st.session_state.chat_messages:
+            if msg["sender"] == "user":
+                st.markdown(f"<div style='text-align:right; margin:6px 0;'><span style='background:#E7752F; color:white; padding:8px 12px; border-radius:12px; font-size:14px;'>{msg['text']}</span></div>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"<div style='text-align:left; margin:6px 0;'><span style='background:#F0E9D2; color:#063260; padding:8px 12px; border-radius:12px; font-size:14px;'>{msg['text']}</span></div>", unsafe_allow_html=True)
+
+    user_msg = st.chat_input(tr("type_message"))
+    if user_msg:
+        st.session_state.chat_messages.append({"sender": "user", "text": user_msg})
+        lang = st.session_state.lang or "en"
+        bot_reply = random.choice(AUTO_RESPONSES.get(lang, AUTO_RESPONSES["en"]))
+        st.session_state.chat_messages.append({"sender": "worker", "text": bot_reply})
+        st.rerun()
+
+    st.write("")
+    if st.button("⬅ " + tr("back"), use_container_width=True, key="chat_back"):
+        st.session_state.page = "active_booking"
+        st.rerun()
+
+def page_history():
+    app_title()
+    st.write("")
+    if st.button("⬅ " + tr("back"), key="history_back"):
+        st.session_state.page = "home"
+        st.rerun()
+
+    st.subheader(tr("history_title"))
+    bookings = get_user_bookings(st.session_state.user_phone)
+
+    if not bookings:
+        st.info("No bookings found in history.")
+        return
+
+    for b in bookings:
+        b_id, s_service, s_addr, s_worker, s_status, s_rating, s_review, s_created, s_pay, f_amt = b
+        with st.expander(f"🛠️ {s_service} — {s_status} ({s_created[:10]})"):
+            st.write(f"**Worker:** {s_worker or 'Assigned'}")
+            st.write(f"**Address:** {s_addr}")
+            st.write(f"**Payment Method:** {s_pay}")
+            if s_status == "Completed":
+                st.write(f"**Total Bill Amount:** Rs. {f_amt}")
+            
+            if s_status == "Completed" and s_rating > 0:
+                st.success(f"Rated: {'⭐' * s_rating} — '{s_review}'")
+            elif s_status == "Completed":
+                st.write(f"**{tr('rate_worker')}**")
+                stars = st.slider("Rating", 1, 5, 5, key=f"rate_stars_{b_id}")
+                rev_text = st.text_input("Review comment", placeholder="Great service!", key=f"rate_review_{b_id}")
+                if st.button(tr("submit_rating"), key=f"submit_rate_{b_id}"):
+                    update_booking_rating(b_id, stars, rev_text)
+                    st.success("Thank you for your feedback!")
+                    st.rerun()
+
 # ---------------------------------------------------------------------------
-# ROUTER (Persistent Check)
+# ROUTER
 # ---------------------------------------------------------------------------
-if not st.session_state.logged_in:
-    page_login()
-else:
+def main():
     page = st.session_state.page
-    if page == "home" or page == "login":
+    if not st.session_state.logged_in or page == "login":
+        page_login()
+    elif page == "home":
         page_home()
     elif page == "category":
         page_category()
     elif page == "booking":
         page_booking()
-    elif page == "chat":
-        page_chat()
-    elif page == "call":
-        page_call()
+    elif page == "active_booking":
+        page_active_booking()
+    elif page == "call_screen":
+        page_call_screen()
+    elif page == "chat_screen":
+        page_chat_screen()
     elif page == "history":
         page_history()
     else:
         page_home()
+
+if __name__ == "__main__":
+    main()
