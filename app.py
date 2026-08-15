@@ -1,12 +1,12 @@
 import time
 import random
 import os
-import sqlite3
 import hashlib
-from datetime import datetime
+from datetime import datetime, date
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
+from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
 # PAGE CONFIG
@@ -18,129 +18,122 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# DATABASE SETUP (SQLite)
+# DATABASE SETUP (Supabase — permanent, cloud, free tier)
 # ---------------------------------------------------------------------------
-DB_PATH = "handyman.db"
+@st.cache_resource
+def get_supabase() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-def get_db():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT DEFAULT 'customer',
-            name TEXT DEFAULT 'User',
-            service_type TEXT DEFAULT 'plumber',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_phone TEXT NOT NULL,
-            service TEXT NOT NULL,
-            address TEXT NOT NULL,
-            worker_name TEXT,
-            visit_charge REAL DEFAULT 500,
-            final_amount REAL DEFAULT 500,
-            payment_method TEXT DEFAULT 'Cash',
-            status TEXT DEFAULT 'Pending',
-            rating INTEGER DEFAULT 0,
-            review TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
 
 def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
-def register_user(phone, password, role="customer", name="User", service_type="plumber"):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE phone = ?", (phone,))
-    if cur.fetchone():
-        conn.close()
+
+def register_user(phone, password, role="customer", name="User", service_type="plumber",
+                   cnic_number=None, cnic_expiry=None, cnic_front_url=None,
+                   cnic_back_url=None, selfie_url=None):
+    sb = get_supabase()
+    existing = sb.table("users").select("id").eq("phone", phone).execute()
+    if existing.data:
         return False, "exists"
-    cur.execute(
-        "INSERT INTO users (phone, password_hash, role, name, service_type) VALUES (?, ?, ?, ?, ?)",
-        (phone, hash_password(password), role, name, service_type),
-    )
-    conn.commit()
-    conn.close()
+    payload = {
+        "phone": phone,
+        "password_hash": hash_password(password),
+        "role": role,
+        "name": name,
+        "service_type": service_type,
+    }
+    if role == "worker":
+        payload.update({
+            "cnic_number": cnic_number,
+            "cnic_expiry": str(cnic_expiry) if cnic_expiry else None,
+            "cnic_front_url": cnic_front_url,
+            "cnic_back_url": cnic_back_url,
+            "selfie_url": selfie_url,
+            "is_verified": True,
+        })
+    sb.table("users").insert(payload).execute()
     return True, "ok"
 
+
+def upload_kyc_file(uploaded_file, phone, label):
+    """Upload a KYC image to Supabase Storage and return its public URL."""
+    sb = get_supabase()
+    ext = uploaded_file.name.split(".")[-1].lower()
+    path = f"{phone}/{label}.{ext}"
+    file_bytes = uploaded_file.getvalue()
+    sb.storage.from_("worker-kyc").upload(
+        path, file_bytes,
+        file_options={"content-type": uploaded_file.type, "upsert": "true"},
+    )
+    return sb.storage.from_("worker-kyc").get_public_url(path)
+
+
 def verify_user(phone, password):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT password_hash, role, name, service_type FROM users WHERE phone = ?", (phone,))
-    row = cur.fetchone()
-    conn.close()
-    if row is None:
+    sb = get_supabase()
+    res = sb.table("users").select("password_hash, role, name, service_type").eq("phone", phone).execute()
+    if not res.data:
         return False, "no_user", None, None, None
-    if row[0] == hash_password(password):
-        return True, "ok", row[1], row[2], row[3]
+    row = res.data[0]
+    if row["password_hash"] == hash_password(password):
+        return True, "ok", row["role"], row["name"], row["service_type"]
     return False, "wrong_pw", None, None, None
 
+
 def update_user_password(phone, new_password):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET password_hash = ? WHERE phone = ?", (hash_password(new_password), phone))
-    conn.commit()
-    conn.close()
+    sb = get_supabase()
+    sb.table("users").update({"password_hash": hash_password(new_password)}).eq("phone", phone).execute()
+
 
 def save_booking(phone, service, address, worker_name, payment_method):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO bookings (customer_phone, service, address, worker_name, payment_method, status) VALUES (?, ?, ?, ?, ?, ?)",
-        (phone, service, address, worker_name, payment_method, "Accepted"),
-    )
-    booking_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return booking_id
+    sb = get_supabase()
+    res = sb.table("bookings").insert({
+        "customer_phone": phone,
+        "service": service,
+        "address": address,
+        "worker_name": worker_name,
+        "payment_method": payment_method,
+        "status": "Accepted",
+    }).execute()
+    return res.data[0]["id"]
+
 
 def update_booking_status_with_amount(booking_id, status, final_amount):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE bookings SET status = ?, final_amount = ? WHERE id = ?", (status, final_amount, booking_id))
-    conn.commit()
-    conn.close()
+    sb = get_supabase()
+    sb.table("bookings").update({"status": status, "final_amount": final_amount}).eq("id", booking_id).execute()
+
 
 def update_booking_rating(booking_id, rating, review):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE bookings SET rating = ?, review = ?, status = 'Completed' WHERE id = ?",
-        (rating, review, booking_id),
-    )
-    conn.commit()
-    conn.close()
+    sb = get_supabase()
+    sb.table("bookings").update({
+        "rating": rating, "review": review, "status": "Completed"
+    }).eq("id", booking_id).execute()
+
 
 def get_user_bookings(phone):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, service, address, worker_name, status, rating, review, created_at, payment_method, final_amount FROM bookings WHERE customer_phone = ? ORDER BY id DESC", (phone,))
-    rows = cur.fetchall()
-    conn.close()
+    sb = get_supabase()
+    res = sb.table("bookings").select("*").eq("customer_phone", phone).order("id", desc=True).execute()
+    rows = []
+    for r in res.data:
+        rows.append((
+            r["id"], r["service"], r["address"], r["worker_name"], r["status"],
+            r["rating"], r["review"], r["created_at"], r["payment_method"], r["final_amount"],
+        ))
     return rows
+
 
 def get_worker_bookings(worker_name):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, service, address, customer_phone, status, visit_charge, payment_method, created_at, final_amount FROM bookings WHERE worker_name = ? ORDER BY id DESC", (worker_name,))
-    rows = cur.fetchall()
-    conn.close()
+    sb = get_supabase()
+    res = sb.table("bookings").select("*").eq("worker_name", worker_name).order("id", desc=True).execute()
+    rows = []
+    for r in res.data:
+        rows.append((
+            r["id"], r["service"], r["address"], r["customer_phone"], r["status"],
+            r["visit_charge"], r["payment_method"], r["created_at"], r["final_amount"],
+        ))
     return rows
-
-init_db()
 
 # ---------------------------------------------------------------------------
 # GLOBAL STYLE
@@ -232,6 +225,16 @@ T = {
         "role_customer": "Customer",
         "role_worker": "Worker / Provider",
         "name_label": "Full Name",
+        "cnic_label": "CNIC Number",
+        "cnic_placeholder": "42101-1234567-1",
+        "cnic_expiry_label": "CNIC Expiry Date",
+        "cnic_front_label": "📄 CNIC Front Photo",
+        "cnic_back_label": "📄 CNIC Back Photo",
+        "selfie_label": "🤳 Selfie holding your CNIC",
+        "err_cnic_expired": "This CNIC is expired. Please use a valid CNIC.",
+        "err_cnic_missing": "Please fill CNIC number and expiry date.",
+        "err_files_missing": "Please upload CNIC front, back, and a selfie holding your CNIC.",
+        "uploading_kyc": "Uploading verification documents...",
         "err_no_user": "No account found with this number. Please register.",
         "err_wrong_pw": "Incorrect password. Please try again.",
         "err_phone_exists": "This number is already registered.",
@@ -310,7 +313,17 @@ T = {
         "role_label": "اکاؤنٹ کی قسم منتخب کریں",
         "role_customer": "کسٹمر",
         "role_worker": "کاریگر / ورکر",
-        "name_label": "पूरा नाम",
+        "name_label": "پورا نام",
+        "cnic_label": "شناختی کارڈ نمبر (CNIC)",
+        "cnic_placeholder": "42101-1234567-1",
+        "cnic_expiry_label": "شناختی کارڈ کی میعاد ختم ہونے کی تاریخ",
+        "cnic_front_label": "📄 شناختی کارڈ کا اگلا حصہ",
+        "cnic_back_label": "📄 شناختی کارڈ کا پچھلا حصہ",
+        "selfie_label": "🤳 اپنا شناختی کارڈ پکڑ کر سیلفی",
+        "err_cnic_expired": "یہ شناختی کارڈ کی میعاد ختم ہو چکی ہے۔ درست کارڈ استعمال کریں۔",
+        "err_cnic_missing": "براہ کرم شناختی کارڈ نمبر اور تاریخ درج کریں۔",
+        "err_files_missing": "براہ کرم شناختی کارڈ کا اگلا، پچھلا حصہ اور سیلفی اپلوڈ کریں۔",
+        "uploading_kyc": "تصدیقی دستاویزات اپلوڈ ہو رہی ہیں...",
         "err_no_user": "اس نمبر سے اکاؤنٹ نہیں ملا۔ براہ کرم رجسٹر کریں۔",
         "err_wrong_pw": "پاس ورڈ غلط ہے۔ دوبارہ کوشش کریں۔",
         "err_phone_exists": "یہ نمبر پہلے سے رجسٹرڈ ہے۔",
@@ -368,7 +381,7 @@ T = {
         "type_message": "پیغام لکھیں...",
         "send": "بھیجیں",
         "history_title": "📋 بکنگ ہسٹری اور ریٹنگ",
-        "worker_dashboard": "👷 ورکر ڈ্যাশবোর্ড",
+        "worker_dashboard": "👷 ورکر ڈیش بورڈ",
         "total_earnings": "💰 کل آمدنی",
         "complete_job": "✅ کام مکمل ہو گیا",
         "rate_worker": "⭐ کاریگر کو ریٹنگ دیں",
@@ -390,6 +403,16 @@ T = {
         "role_customer": "ڪسٽمر",
         "role_worker": "ڪاريگر / ورڪر",
         "name_label": "پورو نالو",
+        "cnic_label": "سڃاڻپي ڪارڊ نمبر (CNIC)",
+        "cnic_placeholder": "42101-1234567-1",
+        "cnic_expiry_label": "سڃاڻپي ڪارڊ جي ختم ٿيڻ جي تاريخ",
+        "cnic_front_label": "📄 ڪارڊ جو اڳيون پاسو",
+        "cnic_back_label": "📄 ڪارڊ جو پوئتين پاسو",
+        "selfie_label": "🤳 ڪارڊ پڪڙي سيلفي",
+        "err_cnic_expired": "هي ڪارڊ ختم ٿي چڪو آهي. صحيح ڪارڊ استعمال ڪريو.",
+        "err_cnic_missing": "مهرباني ڪري ڪارڊ نمبر ۽ تاريخ داخل ڪريو.",
+        "err_files_missing": "مهرباني ڪري ڪارڊ جو اڳيون، پوئتين پاسو ۽ سيلفي اپلوڊ ڪريو.",
+        "uploading_kyc": "دستاويز اپلوڊ ٿي رهيا آهن...",
         "err_no_user": "هن نمبر سان اڪائونٽ نه مليو. رجسٽر ڪريو.",
         "err_wrong_pw": "پاسورڊ غلط آهي. ٻيهر ڪوشش ڪريو.",
         "err_phone_exists": "هي نمبر اڳ ۾ رجسٽرڊ آهي.",
@@ -512,6 +535,8 @@ defaults = {
     "reset_otp": None,
     "reset_phone": None,
     "payment_method": "Cash",
+    "awaiting_accept": False,
+    "notif_worker": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -594,18 +619,15 @@ def page_login():
     if st.session_state.auth_mode == "forgot":
         st.markdown(f"**{tr('forgot_pw')}**")
         f_phone = st.text_input(tr("phone_label"), placeholder=tr("phone_placeholder"), key="forgot_phone_input")
-        
+
         if st.session_state.reset_otp is None:
             if st.button(tr("send_otp"), use_container_width=True, type="primary", key="action_send_otp"):
                 if not valid_phone(f_phone):
                     st.error(tr("err_phone_invalid"))
                 else:
-                    conn = get_db()
-                    cur = conn.cursor()
-                    cur.execute("SELECT id FROM users WHERE phone = ?", (f_phone.strip(),))
-                    row = cur.fetchone()
-                    conn.close()
-                    if not row:
+                    sb = get_supabase()
+                    res = sb.table("users").select("id").eq("phone", f_phone.strip()).execute()
+                    if not res.data:
                         st.error(tr("err_no_user"))
                     else:
                         otp_code = str(random.randint(1000, 9999))
@@ -616,7 +638,7 @@ def page_login():
             st.info(tr("otp_sent").format(otp=st.session_state.reset_otp))
             entered_otp = st.text_input(tr("enter_otp"), max_chars=4, key="forgot_otp_input")
             new_pw = st.text_input(tr("new_password"), type="password", key="forgot_new_pw")
-            
+
             if st.button(tr("reset_pw_btn"), use_container_width=True, type="primary", key="action_reset_pw"):
                 if entered_otp.strip() == st.session_state.reset_otp:
                     if len(new_pw.strip()) < 4:
@@ -668,10 +690,26 @@ def page_login():
         else:
             name = st.text_input(tr("name_label"), placeholder="Ali Ahmed", key="reg_name_input")
             role_choice = st.selectbox(tr("role_label"), options=["customer", "worker"], format_func=lambda r: tr("role_customer") if r == "customer" else tr("role_worker"), key="reg_role_input")
-            
+
             s_type = "plumber"
+            cnic_number = None
+            cnic_expiry = None
+            cnic_front_file = None
+            cnic_back_file = None
+            selfie_file = None
+
             if role_choice == "worker":
                 s_type = st.selectbox(tr("select_service"), options=list(SERVICE_LABELS.keys()), format_func=lambda s: SERVICE_LABELS[s], key="reg_service_input")
+
+                st.write("---")
+                st.markdown(f"**🪪 {tr('cnic_label')}**")
+                cnic_number = st.text_input(tr("cnic_label"), placeholder=tr("cnic_placeholder"),
+                                             key="reg_cnic_number", label_visibility="collapsed")
+                cnic_expiry = st.date_input(tr("cnic_expiry_label"), min_value=date.today(),
+                                             key="reg_cnic_expiry")
+                cnic_front_file = st.file_uploader(tr("cnic_front_label"), type=["jpg", "jpeg", "png"], key="reg_cnic_front")
+                cnic_back_file = st.file_uploader(tr("cnic_back_label"), type=["jpg", "jpeg", "png"], key="reg_cnic_back")
+                selfie_file = st.file_uploader(tr("selfie_label"), type=["jpg", "jpeg", "png"], key="reg_selfie")
 
             if st.button(tr("register_btn"), use_container_width=True, type="primary", key="action_register_btn"):
                 if not valid_phone(phone):
@@ -680,8 +718,26 @@ def page_login():
                     st.error("Please enter your name.")
                 elif len(password.strip()) < 4:
                     st.error(tr("err_wrong_pw"))
+                elif role_choice == "worker" and (not cnic_number or not cnic_number.strip()):
+                    st.error(tr("err_cnic_missing"))
+                elif role_choice == "worker" and cnic_expiry <= date.today():
+                    st.error(tr("err_cnic_expired"))
+                elif role_choice == "worker" and (cnic_front_file is None or cnic_back_file is None or selfie_file is None):
+                    st.error(tr("err_files_missing"))
                 else:
-                    ok, reason = register_user(phone.strip(), password, role=role_choice, name=name.strip(), service_type=s_type)
+                    cnic_front_url = cnic_back_url = selfie_url = None
+                    if role_choice == "worker":
+                        with st.spinner(tr("uploading_kyc")):
+                            cnic_front_url = upload_kyc_file(cnic_front_file, phone.strip(), "cnic_front")
+                            cnic_back_url = upload_kyc_file(cnic_back_file, phone.strip(), "cnic_back")
+                            selfie_url = upload_kyc_file(selfie_file, phone.strip(), "selfie")
+
+                    ok, reason = register_user(
+                        phone.strip(), password, role=role_choice, name=name.strip(), service_type=s_type,
+                        cnic_number=cnic_number.strip() if cnic_number else None,
+                        cnic_expiry=cnic_expiry if role_choice == "worker" else None,
+                        cnic_front_url=cnic_front_url, cnic_back_url=cnic_back_url, selfie_url=selfie_url,
+                    )
                     if ok:
                         st.success(tr("reg_success"))
                         st.session_state.auth_mode = "login"
@@ -713,10 +769,10 @@ def page_home():
 
     if st.session_state.user_role == "worker":
         st.subheader(tr("worker_dashboard"))
-        
+
         rows = get_worker_bookings(st.session_state.user_name)
         total_earn = sum([r[8] for r in rows if r[4] == "Completed"])
-        
+
         st.markdown(
             f"""
             <div style='background:#FCFBE8; border:2px solid #F0E9D2; border-radius:14px; padding:12px 16px; margin-bottom:12px; text-align:center;'>
@@ -739,7 +795,7 @@ def page_home():
                     if status == "Completed":
                         st.write(f"**Final Bill Amount:** Rs. {f_amt}")
                     st.write(f"**Date:** {c_at}")
-                    
+
                     if status == "Accepted":
                         final_bill_input = st.number_input("Enter Final Total Bill Amount (Rs.)", min_value=500.0, value=500.0, step=100.0, key=f"bill_{b_id}")
                         if st.button(tr("complete_job"), use_container_width=True, type="primary", key=f"complete_job_{b_id}"):
@@ -833,6 +889,8 @@ def page_booking():
     st.write("")
     if st.button("⬅ " + tr("back"), key="booking_back_btn"):
         st.session_state.page = "category"
+        st.session_state.awaiting_accept = False
+        st.session_state.notif_worker = None
         st.rerun()
 
     s_key = st.session_state.category or "plumber"
@@ -860,24 +918,45 @@ def page_booking():
     )
 
     st.write("")
-    if st.button(tr("find_handyman"), use_container_width=True, type="primary", key="action_find_handyman"):
-        with st.spinner(tr("searching")):
-            time.sleep(1.2)
-        
-        matched_worker = next((w for w in DEMO_WORKERS if w["service"] == s_key), DEMO_WORKERS[0])
-        st.session_state.worker = matched_worker
-        
-        b_id = save_booking(
-            phone=st.session_state.user_phone,
-            service=s_name,
-            address=st.session_state.loc_address,
-            worker_name=matched_worker["name"],
-            payment_method=st.session_state.payment_method,
+
+    if not st.session_state.get("awaiting_accept"):
+        if st.button(tr("find_handyman"), use_container_width=True, type="primary", key="action_find_handyman"):
+            with st.spinner(tr("searching")):
+                time.sleep(1.2)
+
+            matched_worker = next((w for w in DEMO_WORKERS if w["service"] == s_key), DEMO_WORKERS[0])
+            st.session_state.notif_worker = matched_worker
+            st.session_state.awaiting_accept = True
+            st.rerun()
+    else:
+        worker = st.session_state.notif_worker
+        st.info(
+            f"**{tr('notif_title')}**\n\n"
+            + tr("notif_body").format(name=worker["name"], service=s_name)
         )
-        st.session_state.current_booking_id = b_id
-        st.session_state.worker_step = 0
-        st.session_state.page = "active_booking"
-        st.rerun()
+        nc1, nc2 = st.columns(2)
+        with nc1:
+            if st.button("✅ " + tr("accept"), use_container_width=True, type="primary", key="notif_accept_btn"):
+                st.session_state.worker = worker
+
+                b_id = save_booking(
+                    phone=st.session_state.user_phone,
+                    service=s_name,
+                    address=st.session_state.loc_address,
+                    worker_name=worker["name"],
+                    payment_method=st.session_state.payment_method,
+                )
+                st.session_state.current_booking_id = b_id
+                st.session_state.worker_step = 0
+                st.session_state.awaiting_accept = False
+                st.session_state.notif_worker = None
+                st.session_state.page = "active_booking"
+                st.rerun()
+        with nc2:
+            if st.button("❌ " + tr("decline"), use_container_width=True, key="notif_decline_btn"):
+                st.session_state.awaiting_accept = False
+                st.session_state.notif_worker = None
+                st.rerun()
 
 def page_active_booking():
     app_title()
@@ -901,11 +980,11 @@ def page_active_booking():
     )
 
     m = folium.Map(location=[BAHRIA_TOWN_KARACHI["lat"], BAHRIA_TOWN_KARACHI["lng"]], zoom_start=14, tiles="CartoDB positron")
-    
+
     step = st.session_state.worker_step
     lat_offset = 0.012 - (step * 0.003) if step < 4 else 0.0
     lng_offset = 0.008 - (step * 0.002) if step < 4 else 0.0
-    
+
     worker_lat = BAHRIA_TOWN_KARACHI["lat"] + lat_offset
     worker_lng = BAHRIA_TOWN_KARACHI["lng"] + lng_offset
 
@@ -961,7 +1040,7 @@ def page_call_screen():
         """,
         unsafe_allow_html=True,
     )
-    
+
     cc1, cc2 = st.columns(2)
     with cc1:
         if st.button(tr("mute"), use_container_width=True, key="call_mute"):
@@ -983,7 +1062,7 @@ def page_chat_screen():
             lang = st.session_state.lang or "en"
             intro = AUTO_RESPONSES.get(lang, AUTO_RESPONSES["en"])[0]
             st.session_state.chat_messages.append({"sender": "worker", "text": intro})
-        
+
         for msg in st.session_state.chat_messages:
             if msg["sender"] == "user":
                 st.markdown(f"<div style='text-align:right; margin:6px 0;'><span style='background:#E7752F; color:white; padding:8px 12px; border-radius:12px; font-size:14px;'>{msg['text']}</span></div>", unsafe_allow_html=True)
@@ -1019,13 +1098,13 @@ def page_history():
 
     for b in bookings:
         b_id, s_service, s_addr, s_worker, s_status, s_rating, s_review, s_created, s_pay, f_amt = b
-        with st.expander(f"🛠️ {s_service} — {s_status} ({s_created[:10]})"):
+        with st.expander(f"🛠️ {s_service} — {s_status} ({str(s_created)[:10]})"):
             st.write(f"**Worker:** {s_worker or 'Assigned'}")
             st.write(f"**Address:** {s_addr}")
             st.write(f"**Payment Method:** {s_pay}")
             if s_status == "Completed":
                 st.write(f"**Total Bill Amount:** Rs. {f_amt}")
-            
+
             if s_status == "Completed" and s_rating > 0:
                 st.success(f"Rated: {'⭐' * s_rating} — '{s_review}'")
             elif s_status == "Completed":
