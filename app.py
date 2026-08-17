@@ -1,8 +1,8 @@
 import time
 import random
-import os
+import secrets as pysecrets
 import hashlib
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
@@ -31,6 +31,22 @@ def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
 
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# USERS
+# ---------------------------------------------------------------------------
 def register_user(phone, password, role="customer", name="User", service_type="plumber",
                    cnic_number=None, cnic_expiry=None, cnic_front_url=None,
                    cnic_back_url=None, selfie_url=None):
@@ -38,6 +54,12 @@ def register_user(phone, password, role="customer", name="User", service_type="p
     existing = sb.table("users").select("id").eq("phone", phone).execute()
     if existing.data:
         return False, "exists"
+
+    if role == "worker" and cnic_number:
+        cnic_existing = sb.table("users").select("id").eq("cnic_number", cnic_number).execute()
+        if cnic_existing.data:
+            return False, "cnic_exists"
+
     payload = {
         "phone": phone,
         "password_hash": hash_password(password),
@@ -87,53 +109,147 @@ def update_user_password(phone, new_password):
     sb.table("users").update({"password_hash": hash_password(new_password)}).eq("phone", phone).execute()
 
 
-def save_booking(phone, service, address, worker_name, payment_method):
+# ---------------------------------------------------------------------------
+# SESSION PERSISTENCE (stay logged in across reloads)
+# ---------------------------------------------------------------------------
+def create_session(phone):
+    try:
+        sb = get_supabase()
+        token = pysecrets.token_hex(16)
+        sb.table("sessions").insert({"token": token, "phone": phone}).execute()
+        return token
+    except Exception:
+        return None
+
+
+def get_session_phone(token):
+    try:
+        sb = get_supabase()
+        res = sb.table("sessions").select("phone").eq("token", token).execute()
+        if res.data:
+            return res.data[0]["phone"]
+    except Exception:
+        pass
+    return None
+
+
+def delete_session(token):
+    if not token:
+        return
+    try:
+        sb = get_supabase()
+        sb.table("sessions").delete().eq("token", token).execute()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# BOOKINGS / TICKETS
+# ---------------------------------------------------------------------------
+def find_available_worker(service_key, exclude_phones=None):
+    sb = get_supabase()
+    res = sb.table("users").select("phone,name").eq("role", "worker").eq(
+        "service_type", service_key).eq("is_verified", True).execute()
+    exclude_phones = exclude_phones or []
+    candidates = [r for r in res.data if r["phone"] not in exclude_phones]
+    if not candidates:
+        return None
+    return random.choice(candidates)
+
+
+def compute_visit_charge(customer_phone, service_key):
+    """First job for this service = Rs.500, every job after that = Rs.750."""
+    sb = get_supabase()
+    res = sb.table("bookings").select("id").eq("customer_phone", customer_phone).eq(
+        "service_key", service_key).eq("is_warranty", False).eq("status", "Completed").execute()
+    return 500 if len(res.data) == 0 else 750
+
+
+def save_booking(phone, service_label, service_key, address, payment_method, issue_desc,
+                  assigned_worker_phone, visit_charge, is_warranty=False, parent_booking_id=None):
     sb = get_supabase()
     res = sb.table("bookings").insert({
         "customer_phone": phone,
-        "service": service,
+        "service": service_label,
+        "service_key": service_key,
         "address": address,
-        "worker_name": worker_name,
+        "worker_name": None,
+        "assigned_worker_phone": assigned_worker_phone,
         "payment_method": payment_method,
-        "status": "Accepted",
+        "status": "Requested",
+        "issue_desc": issue_desc,
+        "is_warranty": is_warranty,
+        "parent_booking_id": parent_booking_id,
+        "visit_charge": visit_charge,
+        "declined_workers": "",
     }).execute()
     return res.data[0]["id"]
 
 
-def update_booking_status_with_amount(booking_id, status, final_amount):
+def get_booking(booking_id):
     sb = get_supabase()
-    sb.table("bookings").update({"status": status, "final_amount": final_amount}).eq("id", booking_id).execute()
+    res = sb.table("bookings").select("*").eq("id", booking_id).execute()
+    return res.data[0] if res.data else None
+
+
+def accept_booking(booking_id, worker_name):
+    sb = get_supabase()
+    sb.table("bookings").update({"status": "Pending", "worker_name": worker_name}).eq("id", booking_id).execute()
+
+
+def decline_and_reassign(booking_id, current_worker_phone, service_key, declined_str):
+    sb = get_supabase()
+    declined_list = [d for d in (declined_str or "").split(",") if d]
+    declined_list.append(current_worker_phone)
+    next_worker = find_available_worker(service_key, exclude_phones=declined_list)
+    update = {"declined_workers": ",".join(declined_list)}
+    if next_worker:
+        update["assigned_worker_phone"] = next_worker["phone"]
+    else:
+        update["assigned_worker_phone"] = None
+        update["status"] = "Unassigned"
+    sb.table("bookings").update(update).eq("id", booking_id).execute()
+
+
+def cancel_booking(booking_id):
+    sb = get_supabase()
+    sb.table("bookings").update({"status": "Cancelled"}).eq("id", booking_id).execute()
+
+
+def complete_booking(booking_id, final_amount, job_notes):
+    sb = get_supabase()
+    ticket_until = (now_utc() + timedelta(days=3)).isoformat()
+    sb.table("bookings").update({
+        "status": "Completed",
+        "final_amount": final_amount,
+        "job_notes": job_notes,
+        "ticket_open_until": ticket_until,
+    }).eq("id", booking_id).execute()
 
 
 def update_booking_rating(booking_id, rating, review):
     sb = get_supabase()
-    sb.table("bookings").update({
-        "rating": rating, "review": review, "status": "Completed"
-    }).eq("id", booking_id).execute()
+    sb.table("bookings").update({"rating": rating, "review": review}).eq("id", booking_id).execute()
 
 
 def get_user_bookings(phone):
     sb = get_supabase()
     res = sb.table("bookings").select("*").eq("customer_phone", phone).order("id", desc=True).execute()
-    rows = []
-    for r in res.data:
-        rows.append((
-            r["id"], r["service"], r["address"], r["worker_name"], r["status"],
-            r["rating"], r["review"], r["created_at"], r["payment_method"], r["final_amount"],
-        ))
-    return rows
+    return res.data
 
 
-def get_worker_bookings(worker_name):
+def get_worker_requests(worker_phone):
     sb = get_supabase()
-    res = sb.table("bookings").select("*").eq("worker_name", worker_name).order("id", desc=True).execute()
-    rows = []
-    for r in res.data:
-        rows.append((
-            r["id"], r["service"], r["address"], r["customer_phone"], r["status"],
-            r["visit_charge"], r["payment_method"], r["created_at"], r["final_amount"],
-        ))
-    return rows
+    res = sb.table("bookings").select("*").eq("assigned_worker_phone", worker_phone).eq(
+        "status", "Requested").order("id", desc=True).execute()
+    return res.data
+
+
+def get_worker_jobs(worker_phone):
+    sb = get_supabase()
+    res = sb.table("bookings").select("*").eq("assigned_worker_phone", worker_phone).order(
+        "id", desc=True).execute()
+    return [r for r in res.data if r["status"] in ("Pending", "Completed")]
 
 # ---------------------------------------------------------------------------
 # GLOBAL STYLE
@@ -233,6 +349,7 @@ T = {
         "selfie_label": "🤳 Selfie holding your CNIC",
         "err_cnic_expired": "This CNIC is expired. Please use a valid CNIC.",
         "err_cnic_missing": "Please fill CNIC number and expiry date.",
+        "err_cnic_exists": "This CNIC is already registered with another account.",
         "err_files_missing": "Please upload CNIC front, back, and a selfie holding your CNIC.",
         "uploading_kyc": "Uploading verification documents...",
         "err_no_user": "No account found with this number. Please register.",
@@ -267,17 +384,18 @@ T = {
         "logout": "Logout",
         "find_handyman": "Find Handyman",
         "searching": "Searching nearby handymen...",
-        "visit_charge_label": "🧾 Visiting Charges: Rs. 500",
+        "visit_charge_dynamic": "🧾 Visiting Charges: Rs. {amount}",
         "visit_note": "Pay only visiting charges now. Repair cost will be decided on-site.",
-        "visit_warranty": "✅ Warranty: Free repair if same issue occurs again.",
+        "visit_warranty": "✅ Warranty: Free repair if same issue occurs again within 3 days.",
         "payment_method": "💳 Payment Method",
         "pay_cash": "Cash on Delivery",
         "pay_jazzcash": "JazzCash Mobile Wallet",
         "pay_easypaisa": "EasyPaisa Mobile Wallet",
-        "notif_title": "🔔 New Response!",
-        "notif_body": "{name} ({service}) accepted your request and is on the way.",
-        "accept": "Accept",
-        "decline": "Decline",
+        "issue_desc_label": "Briefly describe the problem",
+        "waiting_worker": "⏳ Waiting for a worker to accept your request...",
+        "no_worker_available": "No worker is available right now. Please try again later.",
+        "retry": "🔁 Try Again",
+        "cancel_request": "❌ Cancel Request",
         "worker_enroute": "Worker is on the way",
         "eta": "ETA",
         "min": "min",
@@ -298,6 +416,17 @@ T = {
         "rate_worker": "⭐ Rate Worker",
         "submit_rating": "Submit Feedback",
         "app_tagline": "Book trusted handymen near you",
+        "tab_requests": "🔔 New Requests",
+        "tab_active": "🛠️ My Jobs",
+        "job_notes_label": "Job Details / Work Done",
+        "final_amount_label": "Final Amount (Rs.)",
+        "report_issue": "⚠️ Report Same Issue (Free under Warranty)",
+        "warranty_active_note": "🛡️ This is a free warranty visit for a previous issue.",
+        "ticket_valid_till": "🛡️ Warranty valid till: {date}",
+        "role_badge_worker": "👷 Worker Account",
+        "role_badge_customer": "🙋 Customer Account",
+        "accept": "Accept",
+        "decline": "Decline",
     },
     "ur": {
         "choose_language": "زبان منتخب کریں",
@@ -322,6 +451,7 @@ T = {
         "selfie_label": "🤳 اپنا شناختی کارڈ پکڑ کر سیلفی",
         "err_cnic_expired": "یہ شناختی کارڈ کی میعاد ختم ہو چکی ہے۔ درست کارڈ استعمال کریں۔",
         "err_cnic_missing": "براہ کرم شناختی کارڈ نمبر اور تاریخ درج کریں۔",
+        "err_cnic_exists": "یہ شناختی کارڈ پہلے ہی کسی اور اکاؤنٹ سے رجسٹرڈ ہے۔",
         "err_files_missing": "براہ کرم شناختی کارڈ کا اگلا، پچھلا حصہ اور سیلفی اپلوڈ کریں۔",
         "uploading_kyc": "تصدیقی دستاویزات اپلوڈ ہو رہی ہیں...",
         "err_no_user": "اس نمبر سے اکاؤنٹ نہیں ملا۔ براہ کرم رجسٹر کریں۔",
@@ -356,17 +486,18 @@ T = {
         "logout": "لاگ آؤٹ",
         "find_handyman": "کاریگر تلاش کریں",
         "searching": "قریبی کاریگر تلاش کیے جا رہے ہیں...",
-        "visit_charge_label": "🧾 وزٹنگ چارجز: روپے 500",
+        "visit_charge_dynamic": "🧾 وزٹنگ چارجز: روپے {amount}",
         "visit_note": "ابھی صرف وزٹنگ چارجز ادا کریں۔ کام دیکھنے کے بعد قیمت طے ہوگی۔",
-        "visit_warranty": "✅ گارنٹی: اگر دوبارہ مسئلہ آیا تو مرمت مفت ہوگی۔",
+        "visit_warranty": "✅ گارنٹی: اگر 3 دن کے اندر دوبارہ وہی مسئلہ آیا تو مرمت مفت ہوگی۔",
         "payment_method": "💳 ادائیگی کا طریقہ",
         "pay_cash": "کیش آن ڈلیوری",
         "pay_jazzcash": "جاز کیش موبائل والٹ",
         "pay_easypaisa": "ایزی پیسا موبائل والٹ",
-        "notif_title": "🔔 نیا جواب!",
-        "notif_body": "{name} ({service}) نے آپ کی درخواست قبول کر لی ہے اور راستے میں ہے۔",
-        "accept": "قبول کریں",
-        "decline": "مسترد کریں",
+        "issue_desc_label": "مسئلہ مختصراً بیان کریں",
+        "waiting_worker": "⏳ کاریگر کے آپ کی درخواست قبول کرنے کا انتظار ہے...",
+        "no_worker_available": "فی الحال کوئی کاریگر دستیاب نہیں۔ بعد میں کوشش کریں۔",
+        "retry": "🔁 دوبارہ کوشش کریں",
+        "cancel_request": "❌ درخواست منسوخ کریں",
         "worker_enroute": "کاریگر راستے میں ہے",
         "eta": "متوقع وقت",
         "min": "منٹ",
@@ -387,6 +518,17 @@ T = {
         "rate_worker": "⭐ کاریگر کو ریٹنگ دیں",
         "submit_rating": "فیڈ بیک جمع کریں",
         "app_tagline": "اپنے قریب قابلِ اعتماد کاریگر بک کریں",
+        "tab_requests": "🔔 نئی درخواستیں",
+        "tab_active": "🛠️ میرے کام",
+        "job_notes_label": "کام کی تفصیل",
+        "final_amount_label": "حتمی رقم (روپے)",
+        "report_issue": "⚠️ وہی مسئلہ دوبارہ رپورٹ کریں (گارنٹی کے تحت مفت)",
+        "warranty_active_note": "🛡️ یہ پرانے مسئلے کے لیے مفت گارنٹی وزٹ ہے۔",
+        "ticket_valid_till": "🛡️ گارنٹی کی میعاد: {date}",
+        "role_badge_worker": "👷 ورکر اکاؤنٹ",
+        "role_badge_customer": "🙋 کسٹمر اکاؤنٹ",
+        "accept": "قبول کریں",
+        "decline": "مسترد کریں",
     },
     "sd": {
         "choose_language": "ٻولي چونڊيو",
@@ -411,6 +553,7 @@ T = {
         "selfie_label": "🤳 ڪارڊ پڪڙي سيلفي",
         "err_cnic_expired": "هي ڪارڊ ختم ٿي چڪو آهي. صحيح ڪارڊ استعمال ڪريو.",
         "err_cnic_missing": "مهرباني ڪري ڪارڊ نمبر ۽ تاريخ داخل ڪريو.",
+        "err_cnic_exists": "هي ڪارڊ اڳ ۾ ئي ٻي اڪائونٽ سان رجسٽرڊ آهي.",
         "err_files_missing": "مهرباني ڪري ڪارڊ جو اڳيون، پوئتين پاسو ۽ سيلفي اپلوڊ ڪريو.",
         "uploading_kyc": "دستاويز اپلوڊ ٿي رهيا آهن...",
         "err_no_user": "هن نمبر سان اڪائونٽ نه مليو. رجسٽر ڪريو.",
@@ -445,17 +588,18 @@ T = {
         "logout": "لاگ آئوٽ",
         "find_handyman": "ڪاريگر ڳوليو",
         "searching": "ويجهڙا ڪاريگر ڳوليا پيا وڃن...",
-        "visit_charge_label": "🧾 وزٽنگ چارجز: 500 روپيا",
+        "visit_charge_dynamic": "🧾 وزٽنگ چارجز: روپيا {amount}",
         "visit_note": "هاڻي رڳو وزٽنگ چارجز ڏيو. ڪم ڏسڻ کان پوءِ قيمت طئي ٿيندي.",
-        "visit_warranty": "✅ گارنٽي: جيڪڏهن ساڳيو مسئلو ٻيهر ٿيو ته مرمت مفت هوندي.",
+        "visit_warranty": "✅ گارنٽي: جيڪڏهن 3 ڏينهن اندر ساڳيو مسئلو ٻيهر ٿيو ته مرمت مفت هوندي.",
         "payment_method": "💳 ادائگي جو طريقو",
         "pay_cash": "ڪيش آن ڊليوري",
         "pay_jazzcash": "جاز ڪيش موبائل والٽ",
         "pay_easypaisa": "ايزي پيسا موبائل والٽ",
-        "notif_title": "🔔 نئون جواب!",
-        "notif_body": "{name} ({service}) اوهان جي درخواست قبول ڪئي آهي ۽ رستي ۾ آهي.",
-        "accept": "قبول ڪريو",
-        "decline": "رد ڪريو",
+        "issue_desc_label": "مسئلو مختصر بيان ڪريو",
+        "waiting_worker": "⏳ ڪاريگر جي اوهان جي درخواست قبول ڪرڻ جو انتظار آهي...",
+        "no_worker_available": "هن وقت ڪو به ڪاريگر موجود ناهي. بعد ۾ ڪوشش ڪريو.",
+        "retry": "🔁 ٻيهر ڪوشش ڪريو",
+        "cancel_request": "❌ درخواست رد ڪريو",
         "worker_enroute": "ڪاريگر رستي ۾ آهي",
         "eta": "لڳ ڀڳ وقت",
         "min": "منٽ",
@@ -476,6 +620,17 @@ T = {
         "rate_worker": "⭐ ڪاريگر کي ريٽنگ ڏيو",
         "submit_rating": "فيڊبيڪ موڪليو",
         "app_tagline": "پنهنجي ويجهو ڀروسي وارا ڪاريگر بڪ ڪريو",
+        "tab_requests": "🔔 نيون درخواستون",
+        "tab_active": "🛠️ منهنجا ڪم",
+        "job_notes_label": "ڪم جي تفصيل",
+        "final_amount_label": "آخري رقم (روپيا)",
+        "report_issue": "⚠️ ساڳيو مسئلو ٻيهر ٻڌايو (گارنٽي هيٺ مفت)",
+        "warranty_active_note": "🛡️ هي پراڻي مسئلي لاءِ مفت گارنٽي وزٽ آهي.",
+        "ticket_valid_till": "🛡️ گارنٽي جي ميعاد: {date}",
+        "role_badge_worker": "👷 ورڪر اڪائونٽ",
+        "role_badge_customer": "🙋 ڪسٽمر اڪائونٽ",
+        "accept": "قبول ڪريو",
+        "decline": "رد ڪريو",
     },
 }
 
@@ -505,13 +660,6 @@ SERVICE_LABELS = {
     "painter": "Painter",
 }
 
-DEMO_WORKERS = [
-    {"name": "Ali Ahmed", "rating": 4.8, "service": "plumber"},
-    {"name": "Bilal Khan", "rating": 4.6, "service": "electrician"},
-    {"name": "Sana Malik", "rating": 4.9, "service": "ac_repairing"},
-    {"name": "Usman Tariq", "rating": 4.7, "service": "solar_system"},
-]
-
 # ---------------------------------------------------------------------------
 # SESSION STATE INIT
 # ---------------------------------------------------------------------------
@@ -522,9 +670,8 @@ defaults = {
     "user_name": "User",
     "page": "login",
     "category": None,
-    "booking_state": None,
-    "worker": None,
     "worker_step": 0,
+    "tracked_booking_id": None,
     "current_booking_id": None,
     "chat_messages": [],
     "loc_mode": "current",
@@ -535,16 +682,42 @@ defaults = {
     "reset_otp": None,
     "reset_phone": None,
     "payment_method": "Cash",
-    "awaiting_accept": False,
-    "notif_worker": None,
+    "session_token": None,
+    "warranty_claim": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+# Auto-login via URL token (keeps user logged in after closing/reopening app)
+if not st.session_state.logged_in:
+    _t = st.query_params.get("t")
+    if _t:
+        _phone = get_session_phone(_t)
+        if _phone:
+            sb = get_supabase()
+            res = sb.table("users").select("role,name,service_type").eq("phone", _phone).execute()
+            if res.data:
+                st.session_state.logged_in = True
+                st.session_state.user_phone = _phone
+                st.session_state.user_role = res.data[0]["role"]
+                st.session_state.user_name = res.data[0]["name"]
+                st.session_state.session_token = _t
+                if st.session_state.page == "login":
+                    st.session_state.page = "home"
+
+
 def tr(key):
     lang = st.session_state.lang or "en"
     return T[lang][key]
+
+
+def do_logout():
+    delete_session(st.session_state.get("session_token"))
+    st.query_params.clear()
+    for k, v in defaults.items():
+        st.session_state[k] = v
+
 
 def get_time_greeting():
     lang = st.session_state.lang or "en"
@@ -564,6 +737,7 @@ def get_time_greeting():
         elif 12 <= hour < 17: return "🌤️ Good Afternoon!"
         elif 17 <= hour < 21: return "🌇 Good Evening!"
         else: return "🌙 Good Night!"
+
 
 def app_title():
     st.markdown(
@@ -676,6 +850,10 @@ def page_login():
                         st.session_state.user_role = role
                         st.session_state.user_name = name
                         st.session_state.page = "home"
+                        token = create_session(phone.strip())
+                        if token:
+                            st.session_state.session_token = token
+                            st.query_params["t"] = token
                         st.rerun()
                     elif reason == "no_user":
                         st.error(tr("err_no_user"))
@@ -742,8 +920,11 @@ def page_login():
                         st.success(tr("reg_success"))
                         st.session_state.auth_mode = "login"
                         st.rerun()
+                    elif reason == "cnic_exists":
+                        st.error(tr("err_cnic_exists"))
                     else:
                         st.error(tr("err_phone_exists"))
+
 
 def page_home():
     top = st.columns([4, 1])
@@ -755,6 +936,100 @@ def page_home():
             st.rerun()
 
     st.write("")
+
+    if st.session_state.user_role == "worker":
+        st.markdown(
+            f"<div style='text-align:center; font-weight:700; color:#E7752F; margin-bottom:6px;'>{tr('role_badge_worker')}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""
+            <div style='background:linear-gradient(135deg,#F0E9D2 0%,#FCFBE8 100%);
+                        border:1.5px solid #E7752F; border-radius:14px; padding:10px 16px;
+                        text-align:center; font-weight:700; font-size:14px; color:#063260;
+                        margin-bottom:12px;'>
+                {get_time_greeting()} — {st.session_state.user_name}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.subheader(tr("worker_dashboard"))
+
+        tab_req, tab_jobs = st.tabs([tr("tab_requests"), tr("tab_active")])
+
+        with tab_req:
+            reqs = get_worker_requests(st.session_state.user_phone)
+            if not reqs:
+                st.info("No new requests right now. Pull to refresh / reopen the app to check again.")
+            for r in reqs:
+                warranty_tag = " 🛡️" if r.get("is_warranty") else ""
+                with st.container(border=True):
+                    st.markdown(f"**{r['service']}{warranty_tag}**")
+                    st.write(f"📍 {r['address']}")
+                    if r.get("issue_desc"):
+                        st.write(f"📝 {r['issue_desc']}")
+                    st.write(f"💰 Rs. {r['visit_charge']}" + (" (FREE — Warranty)" if r.get("is_warranty") else ""))
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("✅ " + tr("accept"), use_container_width=True, type="primary", key=f"acc_{r['id']}"):
+                            accept_booking(r["id"], st.session_state.user_name)
+                            st.rerun()
+                    with c2:
+                        if st.button("❌ " + tr("decline"), use_container_width=True, key=f"dec_{r['id']}"):
+                            decline_and_reassign(r["id"], st.session_state.user_phone, r["service_key"], r.get("declined_workers", ""))
+                            st.rerun()
+
+        with tab_jobs:
+            jobs = get_worker_jobs(st.session_state.user_phone)
+            total_earn = sum([(j.get("final_amount") or 0) for j in jobs if j["status"] == "Completed"])
+            st.markdown(
+                f"""
+                <div style='background:#FCFBE8; border:2px solid #F0E9D2; border-radius:14px; padding:12px 16px; margin-bottom:12px; text-align:center;'>
+                    <div style='font-size:14px; color:#5A4A2A;'>{tr('total_earnings')}</div>
+                    <div style='font-size:24px; font-weight:800; color:#E7752F;'>Rs. {total_earn}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if not jobs:
+                st.info("No jobs yet.")
+            for r in jobs:
+                warranty_tag = " 🛡️" if r.get("is_warranty") else ""
+                with st.expander(f"🛠️ {r['service']}{warranty_tag} — {r['address']} ({r['status']})"):
+                    st.write(f"**Customer Phone:** {r['customer_phone']}")
+                    st.write(f"**Payment Method:** {r['payment_method']}")
+                    st.write(f"**Visiting Charges:** Rs. {r['visit_charge']}")
+                    if r.get("issue_desc"):
+                        st.write(f"**Issue:** {r['issue_desc']}")
+                    st.write(f"**Date:** {r['created_at']}")
+
+                    if r["status"] == "Pending":
+                        job_notes = st.text_area(tr("job_notes_label"), key=f"notes_{r['id']}")
+                        default_amt = 0.0 if r.get("is_warranty") else float(r.get("visit_charge") or 500)
+                        final_amt = st.number_input(tr("final_amount_label"), min_value=0.0, value=default_amt, step=100.0, key=f"amt_{r['id']}")
+                        if st.button(tr("complete_job"), use_container_width=True, type="primary", key=f"comp_{r['id']}"):
+                            complete_booking(r["id"], final_amt, job_notes)
+                            st.success(f"Job completed! Rs. {final_amt} recorded.")
+                            st.rerun()
+                    else:
+                        st.write(f"**Final Bill:** Rs. {r.get('final_amount') or 0}")
+                        if r.get("job_notes"):
+                            st.write(f"**Notes:** {r['job_notes']}")
+                        tu = parse_ts(r.get("ticket_open_until"))
+                        if tu and tu > now_utc():
+                            st.caption(tr("ticket_valid_till").format(date=tu.strftime("%d %b, %I:%M %p")))
+
+        st.write("")
+        if st.button(tr("logout"), use_container_width=True, key="worker_logout_btn"):
+            do_logout()
+            st.rerun()
+        return
+
+    # Customer Home
+    st.markdown(
+        f"<div style='text-align:center; font-weight:700; color:#E7752F; margin-bottom:6px;'>{tr('role_badge_customer')}</div>",
+        unsafe_allow_html=True,
+    )
     st.markdown(
         f"""
         <div style='background:linear-gradient(135deg,#F0E9D2 0%,#FCFBE8 100%);
@@ -766,51 +1041,6 @@ def page_home():
         """,
         unsafe_allow_html=True,
     )
-
-    if st.session_state.user_role == "worker":
-        st.subheader(tr("worker_dashboard"))
-
-        rows = get_worker_bookings(st.session_state.user_name)
-        total_earn = sum([r[8] for r in rows if r[4] == "Completed"])
-
-        st.markdown(
-            f"""
-            <div style='background:#FCFBE8; border:2px solid #F0E9D2; border-radius:14px; padding:12px 16px; margin-bottom:12px; text-align:center;'>
-                <div style='font-size:14px; color:#5A4A2A;'>{tr('total_earnings')}</div>
-                <div style='font-size:24px; font-weight:800; color:#E7752F;'>Rs. {total_earn}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        if not rows:
-            st.info("No service requests assigned yet.")
-        else:
-            for r in rows:
-                b_id, s_name, addr, c_phone, status, v_charge, p_method, c_at, f_amt = r
-                with st.expander(f"🛠️ {s_name.upper()} — {addr} ({status})"):
-                    st.write(f"**Customer Phone:** {c_phone}")
-                    st.write(f"**Payment Method:** {p_method}")
-                    st.write(f"**Visiting Charges:** Rs. {v_charge}")
-                    if status == "Completed":
-                        st.write(f"**Final Bill Amount:** Rs. {f_amt}")
-                    st.write(f"**Date:** {c_at}")
-
-                    if status == "Accepted":
-                        final_bill_input = st.number_input("Enter Final Total Bill Amount (Rs.)", min_value=500.0, value=500.0, step=100.0, key=f"bill_{b_id}")
-                        if st.button(tr("complete_job"), use_container_width=True, type="primary", key=f"complete_job_{b_id}"):
-                            update_booking_status_with_amount(b_id, "Completed", final_bill_input)
-                            st.success(f"Job completed successfully! Final Bill Rs. {final_bill_input} recorded.")
-                            st.rerun()
-
-        st.write("")
-        if st.button(tr("logout"), use_container_width=True, key="worker_logout_btn"):
-            for k, v in defaults.items():
-                st.session_state[k] = v
-            st.rerun()
-        return
-
-    # Customer Home
     st.caption(tr("app_tagline"))
     st.write("---")
 
@@ -858,9 +1088,9 @@ def page_home():
 
     st.write("")
     if st.button(tr("logout"), use_container_width=True, key="customer_logout_btn"):
-        for k, v in defaults.items():
-            st.session_state[k] = v
+        do_logout()
         st.rerun()
+
 
 def page_category():
     app_title()
@@ -884,13 +1114,13 @@ def page_category():
                 st.session_state.page = "booking"
                 st.rerun()
 
+
 def page_booking():
     app_title()
     st.write("")
     if st.button("⬅ " + tr("back"), key="booking_back_btn"):
         st.session_state.page = "category"
-        st.session_state.awaiting_accept = False
-        st.session_state.notif_worker = None
+        st.session_state.warranty_claim = None
         st.rerun()
 
     s_key = st.session_state.category or "plumber"
@@ -898,9 +1128,21 @@ def page_booking():
     s_name = SERVICE_LABELS.get(s_key, "Service")
 
     st.subheader(f"{s_icon} {s_name}")
-    st.markdown(tr("visit_charge_label"))
+
+    claim = st.session_state.warranty_claim
+    is_warranty = bool(claim and claim.get("service_key") == s_key)
+
+    if is_warranty:
+        st.warning(tr("warranty_active_note"))
+        charge_preview = 0
+    else:
+        charge_preview = compute_visit_charge(st.session_state.user_phone, s_key)
+
+    st.markdown(tr("visit_charge_dynamic").format(amount=charge_preview))
     st.info(tr("visit_note"))
     st.success(tr("visit_warranty"))
+
+    issue_desc = st.text_area(tr("issue_desc_label"), key="booking_issue_desc")
 
     st.write("---")
     st.markdown(f"**{tr('payment_method')}**")
@@ -919,61 +1161,105 @@ def page_booking():
 
     st.write("")
 
-    if not st.session_state.get("awaiting_accept"):
-        if st.button(tr("find_handyman"), use_container_width=True, type="primary", key="action_find_handyman"):
-            with st.spinner(tr("searching")):
-                time.sleep(1.2)
+    if st.button(tr("find_handyman"), use_container_width=True, type="primary", key="action_find_handyman"):
+        with st.spinner(tr("searching")):
+            time.sleep(0.8)
 
-            matched_worker = next((w for w in DEMO_WORKERS if w["service"] == s_key), DEMO_WORKERS[0])
-            st.session_state.notif_worker = matched_worker
-            st.session_state.awaiting_accept = True
+        assigned = None
+        parent_id = None
+        if is_warranty:
+            parent_id = claim.get("parent_id")
+            pref_phone = claim.get("worker_phone")
+            if pref_phone:
+                sb = get_supabase()
+                w = sb.table("users").select("phone,name").eq("phone", pref_phone).eq("role", "worker").execute()
+                if w.data:
+                    assigned = w.data[0]
+
+        if not assigned:
+            assigned = find_available_worker(s_key)
+
+        if not assigned:
+            st.error(tr("no_worker_available"))
+        else:
+            visit_charge = 0 if is_warranty else charge_preview
+            b_id = save_booking(
+                phone=st.session_state.user_phone,
+                service_label=s_name,
+                service_key=s_key,
+                address=st.session_state.loc_address,
+                payment_method=st.session_state.payment_method,
+                issue_desc=issue_desc,
+                assigned_worker_phone=assigned["phone"],
+                visit_charge=visit_charge,
+                is_warranty=is_warranty,
+                parent_booking_id=parent_id,
+            )
+            st.session_state.current_booking_id = b_id
+            st.session_state.warranty_claim = None
+            st.session_state.page = "active_booking"
             st.rerun()
-    else:
-        worker = st.session_state.notif_worker
-        st.info(
-            f"**{tr('notif_title')}**\n\n"
-            + tr("notif_body").format(name=worker["name"], service=s_name)
-        )
-        nc1, nc2 = st.columns(2)
-        with nc1:
-            if st.button("✅ " + tr("accept"), use_container_width=True, type="primary", key="notif_accept_btn"):
-                st.session_state.worker = worker
 
-                b_id = save_booking(
-                    phone=st.session_state.user_phone,
-                    service=s_name,
-                    address=st.session_state.loc_address,
-                    worker_name=worker["name"],
-                    payment_method=st.session_state.payment_method,
-                )
-                st.session_state.current_booking_id = b_id
-                st.session_state.worker_step = 0
-                st.session_state.awaiting_accept = False
-                st.session_state.notif_worker = None
-                st.session_state.page = "active_booking"
-                st.rerun()
-        with nc2:
-            if st.button("❌ " + tr("decline"), use_container_width=True, key="notif_decline_btn"):
-                st.session_state.awaiting_accept = False
-                st.session_state.notif_worker = None
-                st.rerun()
 
 def page_active_booking():
     app_title()
     st.write("")
 
-    worker = st.session_state.worker or DEMO_WORKERS[0]
-    w_name = worker["name"]
-    w_rating = worker["rating"]
-    s_key = st.session_state.category or "plumber"
-    s_name = SERVICE_LABELS.get(s_key, "Service")
+    b = get_booking(st.session_state.current_booking_id)
+    if not b:
+        st.error("Booking not found.")
+        if st.button("⬅ " + tr("back"), key="ab_notfound_back"):
+            st.session_state.page = "home"
+            st.rerun()
+        return
+
+    status = b["status"]
+
+    if status == "Requested":
+        st.info(tr("waiting_worker"))
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🔄 Refresh", use_container_width=True, key="ab_refresh"):
+                st.rerun()
+        with c2:
+            if st.button(tr("cancel_request"), use_container_width=True, key="ab_cancel"):
+                cancel_booking(b["id"])
+                st.session_state.current_booking_id = None
+                st.session_state.page = "home"
+                st.rerun()
+        return
+
+    if status == "Unassigned":
+        st.error(tr("no_worker_available"))
+        if st.button(tr("retry"), use_container_width=True, key="ab_retry"):
+            cancel_booking(b["id"])
+            st.session_state.current_booking_id = None
+            st.session_state.page = "booking"
+            st.rerun()
+        return
+
+    if status in ("Completed", "Cancelled"):
+        st.success("This job has finished. Check your booking history.")
+        if st.button(tr("history_title"), use_container_width=True, key="ab_to_history"):
+            st.session_state.current_booking_id = None
+            st.session_state.page = "history"
+            st.rerun()
+        return
+
+    # status == Pending -> worker accepted, show tracking screen
+    if st.session_state.tracked_booking_id != b["id"]:
+        st.session_state.worker_step = 0
+        st.session_state.tracked_booking_id = b["id"]
+
+    w_name = b.get("worker_name") or "Worker"
+    s_name = b.get("service", "Service")
 
     st.markdown(
         f"""
         <div style='background:#FCFBE8; border:2px solid #F0E9D2; border-radius:16px; padding:14px 16px; margin-bottom:14px; text-align:center;'>
             <div style='font-size:18px; font-weight:800; color:#063260;'>{w_name}</div>
-            <div style='font-size:14px; color:#E7752F; font-weight:600;'>{s_name} ⭐ {w_rating}</div>
-            <div style='font-size:13px; color:#5A4A2A; margin-top:4px;'>📍 {st.session_state.loc_address}</div>
+            <div style='font-size:14px; color:#E7752F; font-weight:600;'>{s_name}</div>
+            <div style='font-size:13px; color:#5A4A2A; margin-top:4px;'>📍 {b['address']}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1023,18 +1309,25 @@ def page_active_booking():
             st.rerun()
 
     st.write("")
-    if st.button("⬅ " + tr("back"), use_container_width=True, key="active_to_home"):
-        st.session_state.page = "home"
-        st.rerun()
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🔄 Refresh Status", use_container_width=True, key="ab_pending_refresh"):
+            st.rerun()
+    with c2:
+        if st.button("⬅ " + tr("back"), use_container_width=True, key="active_to_home"):
+            st.session_state.page = "home"
+            st.rerun()
+
 
 def page_call_screen():
     app_title()
     st.write("")
-    worker = st.session_state.worker or DEMO_WORKERS[0]
+    b = get_booking(st.session_state.current_booking_id)
+    w_name = (b.get("worker_name") if b else None) or "Worker"
     st.markdown(
         f"""
         <div style='text-align:center; padding:30px 0;'>
-            <div style='font-size:24px; font-weight:800; color:#063260;'>{worker['name']}</div>
+            <div style='font-size:24px; font-weight:800; color:#063260;'>{w_name}</div>
             <div style='font-size:15px; color:#E7752F; margin-top:6px;'>{tr('call_screen_title')}</div>
         </div>
         """,
@@ -1050,10 +1343,12 @@ def page_call_screen():
             st.session_state.page = "active_booking"
             st.rerun()
 
+
 def page_chat_screen():
     app_title()
-    worker = st.session_state.worker or DEMO_WORKERS[0]
-    st.markdown(f"**💬 {tr('chat_title')} {worker['name']}**")
+    b = get_booking(st.session_state.current_booking_id)
+    w_name = (b.get("worker_name") if b else None) or "Worker"
+    st.markdown(f"**💬 {tr('chat_title')} {w_name}**")
     st.write("---")
 
     chat_container = st.container(height=260)
@@ -1082,6 +1377,7 @@ def page_chat_screen():
         st.session_state.page = "active_booking"
         st.rerun()
 
+
 def page_history():
     app_title()
     st.write("")
@@ -1097,24 +1393,42 @@ def page_history():
         return
 
     for b in bookings:
-        b_id, s_service, s_addr, s_worker, s_status, s_rating, s_review, s_created, s_pay, f_amt = b
-        with st.expander(f"🛠️ {s_service} — {s_status} ({str(s_created)[:10]})"):
-            st.write(f"**Worker:** {s_worker or 'Assigned'}")
-            st.write(f"**Address:** {s_addr}")
-            st.write(f"**Payment Method:** {s_pay}")
-            if s_status == "Completed":
-                st.write(f"**Total Bill Amount:** Rs. {f_amt}")
+        warranty_tag = " 🛡️" if b.get("is_warranty") else ""
+        with st.expander(f"🛠️ {b['service']}{warranty_tag} — {b['status']} ({str(b['created_at'])[:10]})"):
+            st.write(f"**Worker:** {b.get('worker_name') or 'Not yet assigned'}")
+            st.write(f"**Address:** {b['address']}")
+            st.write(f"**Payment Method:** {b['payment_method']}")
+            if b.get("issue_desc"):
+                st.write(f"**Issue:** {b['issue_desc']}")
 
-            if s_status == "Completed" and s_rating > 0:
-                st.success(f"Rated: {'⭐' * s_rating} — '{s_review}'")
-            elif s_status == "Completed":
-                st.write(f"**{tr('rate_worker')}**")
-                stars = st.slider("Rating", 1, 5, 5, key=f"rate_stars_{b_id}")
-                rev_text = st.text_input("Review comment", placeholder="Great service!", key=f"rate_review_{b_id}")
-                if st.button(tr("submit_rating"), key=f"submit_rate_{b_id}"):
-                    update_booking_rating(b_id, stars, rev_text)
-                    st.success("Thank you for your feedback!")
-                    st.rerun()
+            if b["status"] == "Completed":
+                st.write(f"**Total Bill Amount:** Rs. {b.get('final_amount') or 0}")
+                if b.get("job_notes"):
+                    st.write(f"**Job Notes:** {b['job_notes']}")
+
+                tu = parse_ts(b.get("ticket_open_until"))
+                if tu and tu > now_utc():
+                    st.caption(tr("ticket_valid_till").format(date=tu.strftime("%d %b, %I:%M %p")))
+                    if st.button(tr("report_issue"), key=f"report_{b['id']}"):
+                        st.session_state.category = b.get("service_key")
+                        st.session_state.warranty_claim = {
+                            "parent_id": b["id"],
+                            "worker_phone": b.get("assigned_worker_phone"),
+                            "service_key": b.get("service_key"),
+                        }
+                        st.session_state.page = "booking"
+                        st.rerun()
+
+                if b.get("rating"):
+                    st.success(f"Rated: {'⭐' * b['rating']} — '{b.get('review','')}'")
+                else:
+                    st.write(f"**{tr('rate_worker')}**")
+                    stars = st.slider("Rating", 1, 5, 5, key=f"rate_stars_{b['id']}")
+                    rev_text = st.text_input("Review comment", placeholder="Great service!", key=f"rate_review_{b['id']}")
+                    if st.button(tr("submit_rating"), key=f"submit_rate_{b['id']}"):
+                        update_booking_rating(b["id"], stars, rev_text)
+                        st.success("Thank you for your feedback!")
+                        st.rerun()
 
 # ---------------------------------------------------------------------------
 # ROUTER
